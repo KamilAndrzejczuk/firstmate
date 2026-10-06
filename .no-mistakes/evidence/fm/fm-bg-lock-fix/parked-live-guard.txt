@@ -1,0 +1,1 @@
+ok - Claude Code 2.1.289: live client 6372 hands its lock only to its background session 53013 (job f44b1372)

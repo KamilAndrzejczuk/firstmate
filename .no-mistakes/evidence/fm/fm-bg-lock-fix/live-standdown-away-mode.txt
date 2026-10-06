@@ -1,0 +1,16 @@
+=== root: 8e2cc7a no-mistakes(review): Drop unused parked-client pid global; tests assert exit status ===
+# this tool shell: CLAUDE_PID=87494 session=38689c50-8e89-47fc-9dcf-6e61615b983d (real live interactive Claude, not parked)
+# lab lock before: 590 / fa806074-260b-4eb9-8bf5-dc40c368e473  [590 = another real live interactive Claude, not parked; state/.afk PRESENT (away mode)]
+## Stop #1
+exit=0
+## Stop #2
+exit=0
+## Stop #3
+exit=0
+## fm-lock.sh acquire
+error: another live firstmate session holds the lock (pid 590, session fa806074-260b-4eb9-8bf5-dc40c368e473); operate read-only until resolved
+exit=1
+# lab lock after: 590 / fa806074-260b-4eb9-8bf5-dc40c368e473
+# stand-down marker: absent
+# state: .afk .lock .lock-session demo.meta 
+

@@ -1,0 +1,35 @@
+=== base: e06a46f fix(project-management): use subshell form for Initialize command (#6699) ===
+# this tool shell: CLAUDE_PID=87494 session=38689c50-8e89-47fc-9dcf-6e61615b983d (real live interactive Claude, not parked)
+# lab lock before: 6372 / 35a4dfff-ba42-49d4-b459-73ff8a08e904  [6372 = real live Claude client parked into job f44b1372, which is NOT this session]
+## Stop #1
+exit=0
+## Stop #2
+exit=0
+## Stop #3
+exit=0
+## fm-lock.sh acquire
+error: another live firstmate session holds the lock (pid 6372, session 35a4dfff-ba42-49d4-b459-73ff8a08e904); operate read-only until resolved
+exit=1
+# lab lock after: 6372 / 35a4dfff-ba42-49d4-b459-73ff8a08e904
+# stand-down marker: absent
+# state: .lock .lock-session demo.meta 
+
+=== root: 8e2cc7a no-mistakes(review): Drop unused parked-client pid global; tests assert exit status ===
+# this tool shell: CLAUDE_PID=87494 session=38689c50-8e89-47fc-9dcf-6e61615b983d (real live interactive Claude, not parked)
+# lab lock before: 6372 / 35a4dfff-ba42-49d4-b459-73ff8a08e904  [6372 = real live Claude client parked into job f44b1372, which is NOT this session]
+## Stop #1
+firstmate watcher auto-arm STOOD DOWN: another live session holds this home's session lock (pid 6372, session 35a4dfff-ba42-49d4-b459-73ff8a08e904), and this session could not prove it is that session.
+This session is read-only for the fleet: it will not arm the watcher, and no wake will reach it. Report that supervision is not running from this session; the session holding the lock must restore it, or must exit so this one can take over.
+This notice is shown once while that session holds the lock.
+exit=2
+## Stop #2
+exit=0
+## Stop #3
+exit=0
+## fm-lock.sh acquire
+error: another live firstmate session holds the lock (pid 6372, session 35a4dfff-ba42-49d4-b459-73ff8a08e904); operate read-only until resolved
+exit=1
+# lab lock after: 6372 / 35a4dfff-ba42-49d4-b459-73ff8a08e904
+# stand-down marker: self=87494 owner=6372 session=35a4dfff-ba42-49d4-b459-73ff8a08e904
+# state: .claude-autoarm-standdown-notified .lock .lock-session demo.meta 
+
