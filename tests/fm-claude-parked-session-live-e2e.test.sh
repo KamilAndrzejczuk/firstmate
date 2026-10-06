@@ -78,7 +78,7 @@ engine_ancestry() {  # <engine-pid>
 parked_as_engine() {  # <state> <engine-pid> <session-id> <ancestry>
   env CLAUDE_CODE_SESSION_ID="$3" CLAUDE_PID="$2" bash -c '
     . "$1"
-    fm_session_lock_parked_by_self "$2" "$3" && printf "%s" "$FM_SESSION_LOCK_PARKED_FROM_PID"
+    fm_session_lock_parked_by_self "$2" "$3"
   ' _ "$LIB" "$1" "$4"
 }
 
@@ -98,10 +98,9 @@ while read -r client engine job sid version; do
   mkdir -p "$state"
   printf '%s\n' "$client" > "$state/.lock"
   printf 'client-fresh-id\n' > "$state/.lock-session"
-  got=$(parked_as_engine "$state" "$engine" "$sid" "$pids") \
+  parked_as_engine "$state" "$engine" "$sid" "$pids" \
     || fail "$VERSION: background session $engine (job $job) was not recognised as the conversation its live client $client parked"
-  [ "$got" = "$client" ] || fail "$VERSION: the handoff named client '$got', expected $client"
-  if parked_as_engine "$state" "$engine" "$sid-not-this-session" "$pids" >/dev/null; then
+  if parked_as_engine "$state" "$engine" "$sid-not-this-session" "$pids"; then
     fail "$VERSION: a session id that is not the job's own was handed client $client's lock"
   fi
   checked=$((checked + 1))

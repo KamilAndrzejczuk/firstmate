@@ -480,8 +480,8 @@ write_claude_session_entry() {
   printf '%s\n' "$3" > "$1/sessions/$2.json"
 }
 
-parked() {  # <fakebin> <state>  -> prints the parked client pid
-  lib_eval "$1" "fm_session_lock_parked_by_self '$2' && printf '%s' \"\$FM_SESSION_LOCK_PARKED_FROM_PID\""
+parked() {  # <fakebin> <state>
+  lib_eval "$1" "fm_session_lock_parked_by_self '$2'"
 }
 
 # Not a handoff: <fakebin> <state> <label> <session-id> <claude-pid> <owner>.
@@ -528,9 +528,8 @@ test_parked_client_lock_is_handed_to_its_background_session() {
   fi
 
   # 1. The reported case: the lock's client parked exactly this background job.
-  got=$(FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 parked "$fakebin" "$state") \
-    || fail "the background session was not recognised as the continuation of the client holding the lock"
-  [ "$got" = 6372 ] || fail "the parked client pid was '$got', expected 6372"
+  FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 parked "$fakebin" "$state" \
+    || fail "the background session was not recognised as the continuation of the client holding lock 6372"
   if got=$(FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 foreign_owner "$fakebin" "$state"); then
     fail "the session's own parked client $got was reported as a foreign live owner"
   fi

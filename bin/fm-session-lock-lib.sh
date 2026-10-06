@@ -288,12 +288,8 @@ _fm_claude_session_entry() {  # <pid>
 
 # True when the live lock in state dir $1 is held by the Claude terminal client
 # whose conversation this trusted Claude session continues in the background.
-# Sets FM_SESSION_LOCK_PARKED_FROM_PID to that client pid for a diagnostic caller.
-# shellcheck disable=SC2034 # Output global, read by bin/fm-lock.sh.
-FM_SESSION_LOCK_PARKED_FROM_PID=
 fm_session_lock_parked_by_self() {  # <state> [<ancestry-pids>]
   local state=$1 pids=${2:-} lock_pid pid trusted entry job
-  FM_SESSION_LOCK_PARKED_FROM_PID=
   command -v jq >/dev/null 2>&1 || return 1
   [ -f "$state/.lock" ] && [ ! -L "$state/.lock" ] || return 1
   lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
@@ -319,9 +315,7 @@ EOF
   entry=$(_fm_claude_session_entry "$lock_pid") || return 1
   jq -e --argjson pid "$lock_pid" --arg job "$job" '
     type == "object" and .pid == $pid and .kind == "interactive"
-      and .parkedJobId == $job' "$entry" >/dev/null 2>&1 || return 1
-  # shellcheck disable=SC2034 # Output global, read by bin/fm-lock.sh.
-  FM_SESSION_LOCK_PARKED_FROM_PID=$lock_pid
+      and .parkedJobId == $job' "$entry" >/dev/null 2>&1
 }
 
 # Print the pid bin/fm-lock.sh records on lock line 1 for this session. For a
