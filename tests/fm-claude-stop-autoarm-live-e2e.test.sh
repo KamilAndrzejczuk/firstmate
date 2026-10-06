@@ -162,25 +162,37 @@ fi
 [ ! -e "$HOME_DIR/state/.claude-autoarm.lock" ] || fail "auto-arm owner lock was left behind"
 
 # Live-owner negative control: a separate supported-harness process owns a
-# second isolated home while another Stop hook fires from the same primary
-# project. The competing hook must not replace the session lock, arm, write an
-# epoch, or rewake.
+# second isolated home while one competing session fires two Stop hooks from the
+# same primary project. The competing hook must not replace the session lock,
+# arm, or write an epoch; its first Stop exits 2 once with the read-only
+# stand-down notice and its second Stop stays silent.
 FAKE_CLAUDE="$LAB/claude"
 ln -s /bin/bash "$FAKE_CLAUDE"
 mkdir -p "$LIVE_OWNER_HOME/state" "$LIVE_OWNER_HOME/config"
 printf 'project=fixture\n' > "$LIVE_OWNER_HOME/state/task.meta"
-"$FAKE_CLAUDE" -c 'sleep 3; :' &
+"$FAKE_CLAUDE" -c 'sleep 30; :' &
 LIVE_OWNER_PID=$!
 printf '%s\n' "$LIVE_OWNER_PID" > "$LIVE_OWNER_HOME/state/.lock"
-LIVE_OWNER_RC=0
-printf '%s\n' '{"session_id":"live-owner-control"}' \
-  | FM_HOME="$LIVE_OWNER_HOME" FM_ROOT_OVERRIDE="$PROJECT" "$FAKE_CLAUDE" -c '"$FM_ROOT_OVERRIDE/bin/fm-claude-stop-autoarm.sh"' \
-      >"$LAB/live-owner.out" 2>"$LAB/live-owner.err" || LIVE_OWNER_RC=$?
-[ "$LIVE_OWNER_RC" -eq 0 ] || fail "competing Stop hook returned $LIVE_OWNER_RC while another live session owned the home"
+FM_HOME="$LIVE_OWNER_HOME" FM_ROOT_OVERRIDE="$PROJECT" LAB="$LAB" "$FAKE_CLAUDE" -c '
+  stop() {
+    printf "%s\n" "{\"session_id\":\"live-owner-control\"}" \
+      | "$FM_ROOT_OVERRIDE/bin/fm-claude-stop-autoarm.sh" >"$LAB/live-owner-$1.out" 2>"$LAB/live-owner-$1.err"
+    printf "%s\n" "$?" > "$LAB/live-owner-$1.rc"
+  }
+  stop first
+  stop second
+  :
+' || fail "competing Stop hook fixture session failed"
+[ "$(cat "$LAB/live-owner-first.rc")" = 2 ] || fail "competing Stop hook's first Stop returned $(cat "$LAB/live-owner-first.rc") instead of the one-time stand-down exit 2"
+[ ! -s "$LAB/live-owner-first.out" ] || fail "competing Stop hook wrote to stdout: $(cat "$LAB/live-owner-first.out")"
+grep -q "STOOD DOWN: another live session holds this home's session lock (pid $LIVE_OWNER_PID)" "$LAB/live-owner-first.err" \
+  || fail "competing Stop hook's stand-down notice did not name the live owner: $(cat "$LAB/live-owner-first.err")"
+[ "$(cat "$LAB/live-owner-second.rc")" = 0 ] || fail "competing Stop hook's second Stop returned $(cat "$LAB/live-owner-second.rc")"
+[ ! -s "$LAB/live-owner-second.out" ] && [ ! -s "$LAB/live-owner-second.err" ] || fail "competing Stop hook repeated the stand-down notice"
 [ "$(cat "$LIVE_OWNER_HOME/state/.lock")" = "$LIVE_OWNER_PID" ] || fail "competing Stop hook replaced the live session owner"
 [ ! -e "$LIVE_OWNER_HOME/state/arm-ran" ] || fail "competing Stop hook armed while another live session owned the home"
 [ ! -e "$LIVE_OWNER_HOME/state/.claude-autoarm-epoch" ] || fail "competing Stop hook wrote an epoch while another live session owned the home"
-[ ! -s "$LAB/live-owner.out" ] && [ ! -s "$LAB/live-owner.err" ] || fail "competing Stop hook produced a rewake while another live session owned the home"
-wait "$LIVE_OWNER_PID"
+kill "$LIVE_OWNER_PID" 2>/dev/null || true
+wait "$LIVE_OWNER_PID" 2>/dev/null || true
 
-printf 'ok - Claude %s live E2E reclaimed a stale session lock through session start, completed two tokenless Stop-owned rewake cycles, and preserved the competing-live-owner boundary\n' "$CLAUDE_VERSION"
+printf 'ok - Claude %s live E2E reclaimed a stale session lock through session start, completed two tokenless Stop-owned rewake cycles, and preserved the competing-live-owner boundary with one stand-down notice\n' "$CLAUDE_VERSION"

@@ -508,7 +508,7 @@ It also covers generation-claim single-flight, stuck-claim supersession, superse
 1. Starts with the reproduced stale-lock state.
 2. Receives session start through the tracked SessionStart hook.
 3. Completes two tokenless cycles.
-4. Checks the competing-live-owner negative control.
+4. Checks the competing-live-owner negative control: no arm, epoch write, or lock replacement, one exit-2 stand-down notice on the first Stop, and a silent second Stop.
 
 `tests/fm-turnend-guard.test.sh` covers the cooperative `--claude` guard, including:
 

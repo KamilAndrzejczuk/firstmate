@@ -554,6 +554,9 @@ grok 0.2.103 (89c3d36fb6f1) [stable]
 | omp | `FM_OMP_LIVE_E2E=1 tests/fm-omp-primary-live-e2e.test.sh` | One initial `fm_watch_arm_omp` invocation (the openai-codex model reaches extension tools through omp's `xd://` virtual-file bridge, a `write` to `xd://fm_watch_arm_omp`, counted as the same invocation) started a live watcher; an actionable close spawned a ledger-linked successor and woke main exactly once; the lab is reaped by path, and omp 18.1.11 did not exit within 30s of its rpc stdin closing, recorded as a note. omp 18.1.11, 2026-09-05. |
 | Grok | `FM_GROK_LIVE_E2E=1 tests/fm-grok-continuity-live-e2e.test.sh` | Native task completion surfaced the actionable close and the cycle ledger recorded `reason=actionable-signal`. |
 
+Since 2026-10-06 the Claude row's competing live owner no longer exits silently: its first Stop exits 2 once with the read-only stand-down notice, and the live E2E now expects that notice before a silent second Stop.
+It has not been rerun live since that change.
+
 Pi 0.81.1 repeated the continuity and clean-exit lifecycle on 2026-07-23 after the Calm presentation changes.
 
 Pi 0.86.1 repeated the isolated watcher-only live check on 2026-09-22:
