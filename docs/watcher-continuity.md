@@ -93,7 +93,9 @@ While supervision is still needed and away mode remains inactive, an actionable 
 The hook handles the session lock as follows:
 
 - A numeric session-lock owner that fails the shared `fm_harness_pid_alive` predicate is reclaimed through `bin/fm-lock.sh` before auto-arm state changes.
-- A live owner the session does not own, an absent lock, or a malformed lock keeps the competing hook inert.
+- A live owner that is the Claude terminal client whose conversation Claude Code moved into this background session is taken over through `bin/fm-lock.sh` the same way.
+- An absent or malformed lock keeps the competing hook inert.
+- Any other live owner the session does not own never lets it arm or rewake; the first Stop of each stand-down episode exits 2 once with a read-only notice naming the owner, and later Stops of that episode stay silent.
 
 Whether the session owns that lock is the shared `fm_session_lock_owned_by_self` verdict in `bin/fm-session-lock-lib.sh`.
 That verdict accepts either of two cases:
@@ -102,8 +104,10 @@ That verdict accepts either of two cases:
 - A live lock recorded under this same trusted Claude session id.
 
 With that verdict, a background session keeps arming after its transient helper chain is recycled.
+A conversation moved to the background is different: it continues under a new session id in a detached engine while the terminal client that recorded the lock stays alive, so neither case holds.
+Claude Code's own live-session registry links the client to that background job, and `fm_session_lock_parked_by_self` in the same library owns the proof that lets `bin/fm-lock.sh` hand the lock to the conversation.
 [`turnend-guard.md`](turnend-guard.md#guard-predicates) owns the Claude guard's behavior when that live owner is genuinely another session.
-The stale-owner claim occurs only after the existing AFK and supervision-need gates pass.
+The stale-owner claim, the parked handoff, and the stand-down notice occur only after the existing AFK and supervision-need gates pass.
 
 ### Claude arm failures
 

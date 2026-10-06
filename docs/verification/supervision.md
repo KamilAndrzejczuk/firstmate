@@ -367,6 +367,32 @@ COMPLETE
 ```
 
 No live unattended Claude background session ran on the verifying machine: that topology is documented by the real process listings in issues #3902, #2314, #3398, and #4066, and the coverage above is the structural predicate plus those executable fixtures, not a live pass.
+
+A conversation moved to the background is a different topology, measured on a live macOS home with Claude Code 2.1.289 on 2026-10-06.
+The conversation continued under a new session id in a detached engine (`<claude>/versions/2.1.289 --session-id <new> --fork-session --resume <old transcript>`) whose `--bg-pty-host` parent was reparented to launchd, and its tool shells carried that new id as `CLAUDE_CODE_SESSION_ID` with the engine as `CLAUDE_PID`.
+The terminal client that had recorded the lock stayed alive and re-keyed the sidecar to a fresh id of its own, so neither ancestry nor the trusted id matched and the Stop auto-arm stood down silently on every Stop.
+Claude Code's live-session registry recorded the link: the client's `sessions/<pid>.json` had `kind: "interactive"` and `parkedJobId` naming the job, and the engine's had `kind: "bg"`, that `jobId`, and the new `sessionId`.
+`fm_session_lock_parked_by_self` in `bin/fm-session-lock-lib.sh` requires every one of those facts before `bin/fm-lock.sh` hands the lock to the conversation, and any other live owner gets the auto-arm's one-time stand-down notice.
+`tests/fm-session-lock-ancestry.test.sh` pins the predicate behind a deterministic process table, including each missing or mismatched registry fact, and runs the real lock script, Stop auto-arm, and turn-end guard in a real orphaned client and engine tree.
+`tests/fm-claude-stop-autoarm.test.sh` pins the once-per-episode notice and its away-mode inertness.
+`tests/fm-claude-parked-session-live-e2e.test.sh` is the token-free live guard that refreshes this record: it runs the shipped predicate read-only against whatever parked conversation exists on the machine and skips explicitly when none does.
+All three ran on 2026-10-06 on macOS with bash 3.2.57 as the fake harness interpreter, the live guard against the parked pair described above:
+
+```sh
+bash tests/fm-session-lock-ancestry.test.sh
+bash tests/fm-claude-stop-autoarm.test.sh
+bash tests/fm-claude-parked-session-live-e2e.test.sh
+```
+
+Observed output, bounded to the lines this coverage adds or changes:
+
+```text
+ok - session-lock: a client's lock is handed only to the background session Claude records it parked into
+ok - session-lock e2e: a background session keeps its lock and its supervision across a recycled helper chain
+ok - session-lock e2e: a conversation moved to the background takes over its idle client's lock, and nothing weaker does
+ok - auto-arm: a live foreign owner gets one visible stand-down notice and no arm, epoch, or lock replacement
+ok - Claude Code 2.1.289: live client 6372 hands its lock only to its background session 53013 (job f44b1372)
+```
 [`sessionstart-nudge.md`](../sessionstart-nudge.md#shared-wrapper-and-safety) owns the nudge wrapper's separate ancestry check and its redundant-nudge behavior after helper-chain recycling.
 `tests/fm-watch-arm.test.sh` runs real watcher and arm cycles against durable on-disk state to verify that a delivered reason survives until post-handling acknowledgement and stops replaying after acknowledgement, while an unrelated queue append cannot make a watcher cycle that delivered nothing look successful.
 The same suite ingests a keyed remote-secondmate parent reply through the real adapter, establishes the incremental OPEN DECISIONS cursor, interrupts supervision, and proves re-arm replays every unacknowledged queue row plus the still-open decision through the ordinary drain path.

@@ -312,7 +312,7 @@ test_reclaims_stale_session_lock_before_arming() {
   pass "auto-arm: a demonstrably dead recorded session owner is reclaimed through fm-lock.sh before arming"
 }
 
-test_inert_when_lock_held_by_other_harness() {
+test_stands_down_visibly_once_when_lock_held_by_other_harness() {
   local dir other out status owner_after
   dir=$(make_primary_dir "$TMP_ROOT/other-lock")
   : > "$dir/state/task.meta"
@@ -322,15 +322,38 @@ test_inert_when_lock_held_by_other_harness() {
   "$FAKE_CLAUDE" -c 'sleep 60; :' &
   other=$!
   printf '%s\n' "$other" > "$dir/state/.lock"
-  out=$(printf '%s\n' '{"session_id":"s"}' | FM_HOME="$dir" "$FAKE_CLAUDE" -c '"$FM_HOME/bin/fm-claude-stop-autoarm.sh"' 2>&1); status=$?
+  # One session fires three Stops: under away mode, then twice once it ends.
+  out=$(FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    stop() {
+      printf "%s\n" "{\"session_id\":\"s\"}" | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" > "$FM_HOME/state/stop-$1.out" 2>&1
+      printf "%s\n" "$?" > "$FM_HOME/state/stop-$1.rc"
+    }
+    : > "$FM_HOME/state/.afk"
+    stop away
+    [ ! -e "$FM_HOME/state/.claude-autoarm-standdown-notified" ] || : > "$FM_HOME/state/away-marked"
+    rm -f "$FM_HOME/state/.afk"
+    stop first
+    stop second
+    :
+  ' 2>&1); status=$?
   owner_after=$(cat "$dir/state/.lock")
   kill "$other" 2>/dev/null || true
   wait "$other" 2>/dev/null || true
-  expect_code 0 "$status" "hook must stay inert when another live harness holds the session lock"
+  expect_code 0 "$status" "the fixture session failed: $out"
+  expect_code 0 "$(cat "$dir/state/stop-away.rc")" "away mode must keep a non-owner's hook inert"
+  [ ! -s "$dir/state/stop-away.out" ] || fail "away mode printed a stand-down: $(cat "$dir/state/stop-away.out")"
+  [ ! -e "$dir/state/away-marked" ] || fail "away mode wrote the stand-down marker"
+  expect_code 2 "$(cat "$dir/state/stop-first.rc")" "the first stand-down must be visible"
+  grep -q "STOOD DOWN: another live session holds this home's session lock (pid $other)" "$dir/state/stop-first.out" \
+    || fail "the stand-down notice did not name the live owner: $(cat "$dir/state/stop-first.out")"
+  grep -q "read-only for the fleet" "$dir/state/stop-first.out" \
+    || fail "the stand-down notice did not state the read-only boundary: $(cat "$dir/state/stop-first.out")"
+  expect_code 0 "$(cat "$dir/state/stop-second.rc")" "the same stand-down must not repeat"
+  [ ! -s "$dir/state/stop-second.out" ] || fail "a repeated stand-down printed: $(cat "$dir/state/stop-second.out")"
   [ "$owner_after" = "$other" ] || fail "hook replaced another live harness owner: expected $other, got $owner_after"
   [ ! -e "$dir/state/arm-ran" ] || fail "hook armed while another session owned the lock"
   [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "hook wrote an epoch while another session owned the lock"
-  pass "auto-arm: inert without arm, rewake, or lock replacement when another live harness owns the home"
+  pass "auto-arm: a live foreign owner gets one visible stand-down notice and no arm, epoch, or lock replacement"
 }
 
 test_inert_when_afk() {
@@ -1711,7 +1734,7 @@ test_fm_lock_status_still_works_with_shared_lib() {
 test_inert_in_child_worktree
 test_inert_without_session_lock
 test_reclaims_stale_session_lock_before_arming
-test_inert_when_lock_held_by_other_harness
+test_stands_down_visibly_once_when_lock_held_by_other_harness
 test_inert_when_afk
 test_stale_lock_recovery_preserves_afk_and_need_gates
 test_resolves_outermost_claude_pid_in_nested_bgspare_chain

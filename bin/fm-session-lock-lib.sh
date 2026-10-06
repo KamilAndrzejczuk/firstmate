@@ -10,7 +10,10 @@
 # is a member of this process's contiguous harness ancestry, or the trusted
 # Claude session id below matches the id recorded beside a live lock. Neither
 # signal ever fails open: no id, no sidecar, an untrusted id, or a different
-# recorded id leaves the ancestry verdict exactly as it was.
+# recorded id leaves the ancestry verdict exactly as it was. A third, narrower
+# relation is not ownership at all: the parked handoff below lets bin/fm-lock.sh
+# take over a live lock held by the terminal client whose conversation Claude
+# Code moved into this background session.
 # This file is sourced by scripts and has no side effects on source.
 
 # Cursor process identity is NOT expressible as a command-name pattern and is
@@ -191,9 +194,11 @@ fm_harness_pid_alive() {
 # never from ps argv, where prompts and briefs are visible.
 #
 # A --fork-session successor mints a new id, so it stays a foreign live owner
-# until the pre-fork process exits; that is the safe direction and a documented
-# non-goal. Two genuinely different live sessions sharing one id is not a
-# supported state (Claude refuses to resume a running session under its id).
+# until the pre-fork process exits; that is the safe direction. The one fork
+# Claude Code itself links back to the lock owner - a conversation moved to the
+# background - is the parked handoff below. Two genuinely different live
+# sessions sharing one id is not a supported state (Claude refuses to resume a
+# running session under its id).
 
 # Print the Claude session id this process may own with, or return 1. $1 is the
 # ancestry list an earlier walk already produced, so a caller that walked once
@@ -241,6 +246,82 @@ fm_session_lock_same_session() {  # <state> [<ancestry-pids>]
   trusted=$(fm_session_lock_trusted_session_id "${2:-}") || return 1
   recorded=$(fm_session_lock_recorded_session_id "$state") || return 1
   [ "$recorded" = "$trusted" ]
+}
+
+# --- parked Claude conversation handoff ---------------------------------------
+# Claude Code can move a running interactive conversation to the background: it
+# continues in a detached engine under a NEW session id (`--fork-session
+# --resume`, parented to a background pty host under init, never to the
+# terminal), while the terminal client that recorded the lock stays alive and
+# may re-key the sidecar to a fresh id of its own. Neither signal above can then
+# hold for the engine, so the conversation that owns the home reads its own lock
+# as another live session's for as long as the idle client lives.
+#
+# Claude Code records that link itself in its live-session registry,
+# ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions/<pid>.json: the client's entry
+# (kind "interactive") names the background job its conversation moved to as
+# parkedJobId, and the engine's entry (kind "bg") carries that jobId and the
+# fork's sessionId. Claude clears parkedJobId as soon as the client takes up
+# another conversation and treats a parked client as not holding the
+# conversation live, so the link exists only while the client is parked. The
+# handoff requires every piece: the trusted id above, a live Claude-shaped lock
+# owner outside this ancestry, CLAUDE_PID's own entry being the background job
+# running exactly that trusted id, and the lock owner's entry naming that same
+# job as parked. No jq, a missing, symlinked, or mismatched entry, a different
+# job, or an unparked client is no handoff, so a genuinely different live
+# session keeps the ordinary refusal. This is not an ownership verdict:
+# bin/fm-lock.sh alone acts on it, by re-pointing lock line 1 at this session.
+
+# Print Claude's live-session registry entry for pid $1, or return 1.
+_fm_claude_session_entry() {  # <pid>
+  local dir
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    dir=$CLAUDE_CONFIG_DIR
+  elif [ -n "${HOME:-}" ]; then
+    dir=$HOME/.claude
+  else
+    return 1
+  fi
+  [ -f "$dir/sessions/$1.json" ] && [ ! -L "$dir/sessions/$1.json" ] || return 1
+  printf '%s\n' "$dir/sessions/$1.json"
+}
+
+# True when the live lock in state dir $1 is held by the Claude terminal client
+# whose conversation this trusted Claude session continues in the background.
+# Sets FM_SESSION_LOCK_PARKED_FROM_PID to that client pid for a diagnostic caller.
+# shellcheck disable=SC2034 # Output global, read by bin/fm-lock.sh.
+FM_SESSION_LOCK_PARKED_FROM_PID=
+fm_session_lock_parked_by_self() {  # <state> [<ancestry-pids>]
+  local state=$1 pids=${2:-} lock_pid pid trusted entry job
+  FM_SESSION_LOCK_PARKED_FROM_PID=
+  command -v jq >/dev/null 2>&1 || return 1
+  [ -f "$state/.lock" ] && [ ! -L "$state/.lock" ] || return 1
+  lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
+  case "$lock_pid" in ''|*[!0-9]*) return 1 ;; esac
+  if [ -z "$pids" ]; then
+    pids=$(fm_harness_ancestry_pids) || return 1
+  fi
+  while IFS= read -r pid; do
+    [ "$pid" = "$lock_pid" ] && return 1
+  done <<EOF
+$pids
+EOF
+  trusted=$(fm_session_lock_trusted_session_id "$pids") || return 1
+  fm_harness_pid_alive "$lock_pid" || return 1
+  [ "$FM_HARNESS_IS_CLAUDE" -eq 1 ] || return 1
+  entry=$(_fm_claude_session_entry "$CLAUDE_PID") || return 1
+  job=$(jq -r --argjson pid "$CLAUDE_PID" --arg sid "$trusted" '
+    if type == "object" and .pid == $pid and .kind == "bg" and .sessionId == $sid
+      and (.jobId | type) == "string" and (.jobId | length) > 0
+    then .jobId else empty end' "$entry" 2>/dev/null) || return 1
+  [ -n "$job" ] || return 1
+  case "$job" in *$'\n'*|*$'\r'*) return 1 ;; esac
+  entry=$(_fm_claude_session_entry "$lock_pid") || return 1
+  jq -e --argjson pid "$lock_pid" --arg job "$job" '
+    type == "object" and .pid == $pid and .kind == "interactive"
+      and .parkedJobId == $job' "$entry" >/dev/null 2>&1 || return 1
+  # shellcheck disable=SC2034 # Output global, read by bin/fm-lock.sh.
+  FM_SESSION_LOCK_PARKED_FROM_PID=$lock_pid
 }
 
 # Print the pid bin/fm-lock.sh records on lock line 1 for this session. For a
@@ -293,7 +374,8 @@ EOF
 # contiguous harness ancestry that was not recorded by this same trusted Claude
 # session. Sets FM_SESSION_LOCK_FOREIGN_OWNER_PID for a diagnostic caller.
 # Malformed, missing, dead, and ancestry-uncertain locks are not foreign-owner
-# evidence.
+# evidence, and neither is a lock held by the terminal client whose
+# conversation this session continues (the parked handoff above).
 # shellcheck disable=SC2034 # Output global, read by the sourcing guard caller.
 FM_SESSION_LOCK_FOREIGN_OWNER_PID=
 fm_session_lock_foreign_owner_live() {
@@ -312,6 +394,7 @@ fm_session_lock_foreign_owner_live() {
 $pids
 EOF
   fm_session_lock_same_session "$state" "$pids" && return 1
+  fm_session_lock_parked_by_self "$state" "$pids" && return 1
   # shellcheck disable=SC2034 # Output global, read by the sourcing guard caller.
   FM_SESSION_LOCK_FOREIGN_OWNER_PID=$lock_pid
   return 0

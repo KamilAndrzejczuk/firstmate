@@ -39,12 +39,15 @@ NAMED_CLAUDE="$FAKEBIN/claude"
 # makes every pid dead). The suite itself may run inside a Claude session whose
 # CLAUDE_CODE_SESSION_ID and CLAUDE_PID would leak into the expression, so both
 # are scrubbed and only FM_TEST_SESSION_ID and FM_TEST_CLAUDE_PID reach it.
+# Claude's live-session registry is likewise pinned to FM_TEST_CLAUDE_CONFIG_DIR,
+# an empty directory unless a case provides one, never the real ~/.claude.
 lib_eval() {  # <fakebin> <expression>
   local fakebin=$1 expr=$2
   local -a session_env=()
   [ -z "${FM_TEST_SESSION_ID:-}" ] || session_env+=("CLAUDE_CODE_SESSION_ID=$FM_TEST_SESSION_ID")
   [ -z "${FM_TEST_CLAUDE_PID:-}" ] || session_env+=("CLAUDE_PID=$FM_TEST_CLAUDE_PID")
   env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID ${session_env[@]+"${session_env[@]}"} \
+    CLAUDE_CONFIG_DIR="${FM_TEST_CLAUDE_CONFIG_DIR:-$TMP_ROOT/no-claude-config}" \
     PATH="$fakebin:$PATH" bash -c "
     . \"\$0\"
     kill() { return \${FM_TEST_KILL_RC:-0}; }
@@ -427,6 +430,166 @@ test_anchor_pid_is_the_model_loop_process_only_for_a_trusted_id() {
   pass "session-lock: a trusted id anchors the lock on the model-loop process, anything else on the outermost pid"
 }
 
+# A conversation Claude Code moved to the background, as observed on Claude Code
+# 2.1.289 on macOS. The terminal client 6372 recorded the lock and stays alive on
+# its own tty. The conversation now runs in a detached engine (53013, a
+# version-named `--fork-session --resume` process under a new session id) whose
+# pty host (52125) is parented to launchd, so every hook fires below 53013 and
+# 52125 and never reaches 6372. 7000 is an unrelated live interactive session.
+write_parked_session_ps() {  # <fakebin>
+  cat > "$1/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+field= pid=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) field=$2; shift 2 ;;
+    -p) pid=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+engine=/Users/u/.local/share/claude/versions/2.1.289
+host=/Users/u/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude
+case "$pid:$field" in
+  6372:comm=|7000:comm=) printf '%s\n' claude ;;
+  6372:args=|7000:args=) printf '%s\n' claude ;;
+  6372:ppid=|7000:ppid=) printf '%s\n' 70722 ;;
+  70722:comm=) printf '%s\n' -zsh ;;
+  70722:args=) printf '%s\n' -zsh ;;
+  70722:ppid=) printf '%s\n' 1 ;;
+  53013:comm=) printf '%s\n' "$engine" ;;
+  53013:args=) printf '%s\n' "$engine --session-id E1 --fork-session --resume /tmp/C0.jsonl" ;;
+  53013:ppid=) printf '%s\n' 52125 ;;
+  52125:comm=) printf '%s\n' "$host" ;;
+  52125:args=) printf '%s\n' "$host --bg-pty-host /tmp/cc-daemon/pty/E1.sock 179 63 -- $engine" ;;
+  52125:ppid=) printf '%s\n' 1 ;;
+  1:comm=) printf '%s\n' /sbin/launchd ;;
+  1:args=) printf '%s\n' /sbin/launchd ;;
+  1:ppid=) printf '%s\n' 0 ;;
+  *:comm=) printf '%s\n' bash ;;
+  *:args=) printf '%s\n' 'bash /repo/bin/fm-claude-stop-autoarm.sh' ;;
+  *:ppid=) printf '%s\n' 53013 ;;
+esac
+SH
+  chmod +x "$1/ps"
+}
+
+# Claude's live-session registry entry for one pid: <dir> <pid> <json>.
+write_claude_session_entry() {
+  mkdir -p "$1/sessions"
+  printf '%s\n' "$3" > "$1/sessions/$2.json"
+}
+
+parked() {  # <fakebin> <state>  -> prints the parked client pid
+  lib_eval "$1" "fm_session_lock_parked_by_self '$2' && printf '%s' \"\$FM_SESSION_LOCK_PARKED_FROM_PID\""
+}
+
+# Not a handoff: <fakebin> <state> <label> <session-id> <claude-pid> <owner>.
+# The live owner must keep the ordinary foreign-owner verdict.
+expect_not_parked() {
+  local fakebin=$1 state=$2 label=$3 got
+  if FM_TEST_SESSION_ID=$4 FM_TEST_CLAUDE_PID=$5 parked "$fakebin" "$state" >/dev/null; then
+    fail "$label: a lock the session cannot prove it continues was handed over"
+  fi
+  got=$(FM_TEST_SESSION_ID=$4 FM_TEST_CLAUDE_PID=$5 foreign_owner "$fakebin" "$state") \
+    || fail "$label: the live owner was not reported as foreign"
+  [ "$got" = "$6" ] || fail "$label: the foreign owner pid was '$got', expected $6"
+}
+
+test_parked_client_lock_is_handed_to_its_background_session() {
+  local dir fakebin nojq state config got
+  dir="$TMP_ROOT/parked-session"
+  fakebin=$(fm_fakebin "$dir")
+  nojq=$(fm_fakebin "$dir/nojq")
+  state="$dir/state"
+  config="$dir/claude-config"
+  mkdir -p "$state"
+  write_parked_session_ps "$fakebin"
+  write_parked_session_ps "$nojq"
+  printf '#!/usr/bin/env bash\nexit 2\n' > "$nojq/jq"
+  chmod +x "$nojq/jq"
+  printf '6372\n' > "$state/.lock"
+  # The client re-keyed to a fresh id of its own when its conversation left.
+  printf 'C1\n' > "$state/.lock-session"
+  write_claude_session_entry "$config" 6372 \
+    '{"pid":6372,"sessionId":"C0","kind":"interactive","parkedJobId":"f44b1372"}'
+  write_claude_session_entry "$config" 53013 \
+    '{"pid":53013,"sessionId":"E1","kind":"bg","jobId":"f44b1372"}'
+  write_claude_session_entry "$config" 7000 \
+    '{"pid":7000,"sessionId":"X1","kind":"interactive"}'
+  export FM_TEST_CLAUDE_CONFIG_DIR="$config"
+
+  # The divergence itself: neither ownership signal holds, so every verdict
+  # below is decided by the registry link alone.
+  got=$(FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 lib_eval "$fakebin" 'fm_harness_ancestry_pids' | tr '\n' ' ')
+  [ "$got" = '53013 52125 ' ] || fail "the engine's ancestry was '$got', expected '53013 52125 '"
+  if FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 owned "$fakebin" "$state"; then
+    fail "the engine owned the client's lock outright, so the handoff cases would prove nothing"
+  fi
+
+  # 1. The reported case: the lock's client parked exactly this background job.
+  got=$(FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 parked "$fakebin" "$state") \
+    || fail "the background session was not recognised as the continuation of the client holding the lock"
+  [ "$got" = 6372 ] || fail "the parked client pid was '$got', expected 6372"
+  if got=$(FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 foreign_owner "$fakebin" "$state"); then
+    fail "the session's own parked client $got was reported as a foreign live owner"
+  fi
+
+  # 2. Every weaker combination keeps the ordinary foreign-owner verdict.
+  expect_not_parked "$fakebin" "$state" "no session id" '' '' 6372
+  expect_not_parked "$fakebin" "$state" "an untrusted id" E1 6372 6372
+  expect_not_parked "$fakebin" "$state" "a different trusted id" E2 53013 6372
+  if FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 parked "$nojq" "$state" >/dev/null; then
+    fail "the handoff was decided without a working jq"
+  fi
+  write_claude_session_entry "$config" 6372 \
+    '{"pid":6372,"sessionId":"C0","kind":"interactive","parkedJobId":"0ther000"}'
+  expect_not_parked "$fakebin" "$state" "a client parked into a different job" E1 53013 6372
+  write_claude_session_entry "$config" 6372 \
+    '{"pid":6372,"sessionId":"C2","kind":"interactive"}'
+  expect_not_parked "$fakebin" "$state" "a client that took up another conversation" E1 53013 6372
+  write_claude_session_entry "$config" 6372 \
+    '{"pid":6372,"sessionId":"C0","kind":"bg","parkedJobId":"f44b1372"}'
+  expect_not_parked "$fakebin" "$state" "a lock owner that is not an interactive client" E1 53013 6372
+  write_claude_session_entry "$config" 6372 \
+    '{"pid":9999,"sessionId":"C0","kind":"interactive","parkedJobId":"f44b1372"}'
+  expect_not_parked "$fakebin" "$state" "a client entry describing another pid" E1 53013 6372
+  write_claude_session_entry "$config" 6372 \
+    '{"pid":6372,"sessionId":"C0","kind":"interactive","parkedJobId":"f44b1372"}'
+  write_claude_session_entry "$config" 53013 \
+    '{"pid":53013,"sessionId":"E9","kind":"bg","jobId":"f44b1372"}'
+  expect_not_parked "$fakebin" "$state" "a job entry running another session id" E1 53013 6372
+  write_claude_session_entry "$config" 53013 \
+    '{"pid":53013,"sessionId":"E1","kind":"interactive","jobId":"f44b1372"}'
+  expect_not_parked "$fakebin" "$state" "a model-loop process that is not a background job" E1 53013 6372
+  rm -f "$config/sessions/53013.json"
+  expect_not_parked "$fakebin" "$state" "no registry entry for the model-loop process" E1 53013 6372
+  printf '%s\n' '{"pid":53013,"sessionId":"E1","kind":"bg","jobId":"f44b1372"}' > "$dir/elsewhere.json"
+  ln -s "$dir/elsewhere.json" "$config/sessions/53013.json"
+  expect_not_parked "$fakebin" "$state" "a symlinked registry entry" E1 53013 6372
+  rm -f "$config/sessions/53013.json"
+  write_claude_session_entry "$config" 53013 \
+    '{"pid":53013,"sessionId":"E1","kind":"bg","jobId":"f44b1372"}'
+  FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 parked "$fakebin" "$state" >/dev/null \
+    || fail "restoring the registry link did not restore the handoff"
+  printf '7000\n' > "$state/.lock"
+  expect_not_parked "$fakebin" "$state" "an unrelated live interactive session" E1 53013 7000
+  # A dead client is the ordinary stale-owner reclaim, not a handoff.
+  printf '6372\n' > "$state/.lock"
+  if FM_TEST_KILL_RC=1 FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 parked "$fakebin" "$state" >/dev/null; then
+    fail "a dead client's lock was treated as a live handoff"
+  fi
+  # A lock already inside this ancestry is plain ownership, never a handoff.
+  printf '53013\n' > "$state/.lock"
+  FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 owned "$fakebin" "$state" \
+    || fail "the engine did not own a lock naming its own model-loop pid"
+  if FM_TEST_SESSION_ID=E1 FM_TEST_CLAUDE_PID=53013 parked "$fakebin" "$state" >/dev/null; then
+    fail "a lock this session already owns was reported as a handoff"
+  fi
+  unset FM_TEST_CLAUDE_CONFIG_DIR
+  pass "session-lock: a client's lock is handed only to the background session Claude records it parked into"
+}
+
 # --- end-to-end layer: the real Stop auto-arm in real process trees ----------
 
 install_autoarm_scripts() {
@@ -725,9 +888,17 @@ expect_phase_owned() {  # <dir> <n> <expected-arms> <expected-lock-pid> <label>
 
 # Not the owner: no arm, the guard's foreign-owner diagnostic naming the live
 # owner, and the lock refusal naming both the owner pid and its recorded id.
-expect_phase_foreign() {  # <dir> <n> <expected-arms> <owner-pid> <label>
-  local dir=$1 n=$2 arms=$3 owner=$4 label=$5
-  expect_code 0 "$(phase_value "$dir" "$n" hook.rc)" "$label: the Stop auto-arm did not stand down"
+# The auto-arm's stand-down is visible once per standing-down session (exit 2
+# with a notice naming the owner) and silent afterwards (exit 0, no output).
+expect_phase_foreign() {  # <dir> <n> <expected-arms> <owner-pid> <label> <hook-rc>
+  local dir=$1 n=$2 arms=$3 owner=$4 label=$5 hook_rc=$6
+  expect_code "$hook_rc" "$(phase_value "$dir" "$n" hook.rc)" "$label: the Stop auto-arm did not stand down as expected"
+  if [ "$hook_rc" = 2 ]; then
+    grep -q "STOOD DOWN.*pid $owner, session S1" "$dir/state/phase-$n/hook.out" \
+      || fail "$label: the stand-down notice did not name the owner: $(cat "$dir/state/phase-$n/hook.out")"
+  elif [ -s "$dir/state/phase-$n/hook.out" ]; then
+    fail "$label: a repeated stand-down printed: $(cat "$dir/state/phase-$n/hook.out")"
+  fi
   [ "$(arm_count "$dir")" = "$arms" ] || fail "$label: a non-owner armed: $(arm_count "$dir") arm(s), expected $arms"
   expect_code 0 "$(phase_value "$dir" "$n" guard.rc)" "$label: a non-owner Stop did not end safely"
   grep -q "OWNED BY ANOTHER LIVE SESSION.*lock owner pid $owner" "$dir/state/phase-$n/guard.out" \
@@ -785,13 +956,15 @@ test_e2e_background_session_keeps_its_lock_across_a_recycled_chain() {
   expect_phase_owned "$dir" 2 4 "$frontend" "recycled chain, same session"
 
   # Phases 3-5: a different id, the right id from a CLAUDE_PID outside the run,
-  # and no id at all are each a non-owner over the same broken chain.
+  # and no id at all are each a non-owner over the same broken chain. A trusted
+  # id anchors the first on the spare; the untrusted and absent ids both anchor
+  # on the pty-host, so the third is the second's episode and stays silent.
   fire_phase "$dir" 3 'export CLAUDE_CODE_SESSION_ID=S2; export CLAUDE_PID=$$'
-  expect_phase_foreign "$dir" 3 4 "$frontend" "recycled chain, different session"
+  expect_phase_foreign "$dir" 3 4 "$frontend" "recycled chain, different session" 2
   fire_phase "$dir" 4 "export CLAUDE_CODE_SESSION_ID=S1; export CLAUDE_PID=$frontend"
-  expect_phase_foreign "$dir" 4 4 "$frontend" "recycled chain, untrusted id"
+  expect_phase_foreign "$dir" 4 4 "$frontend" "recycled chain, untrusted id" 2
   fire_phase "$dir" 5 ''
-  expect_phase_foreign "$dir" 5 4 "$frontend" "recycled chain, no id"
+  expect_phase_foreign "$dir" 5 4 "$frontend" "recycled chain, no id" 0
 
   # Phase 6: the front-end exits; the same session reclaims its dead anchor
   # onto the spare - the model-loop process - not onto the outermost pty-host.
@@ -808,6 +981,208 @@ test_e2e_background_session_keeps_its_lock_across_a_recycled_chain() {
 
   : > "$dir/state/stop-spare"
   pass "session-lock e2e: a background session keeps its lock and its supervision across a recycled helper chain"
+}
+
+# --- end-to-end layer: a conversation moved to the background ----------------
+#
+# The topology observed on Claude Code 2.1.289 on macOS: the terminal client
+# that took the lock stays alive and idle, while its conversation continues
+# under a new session id in a detached version-named engine whose pty host has
+# been reparented to init. Client and engine each run one request loop, so the
+# real lock script, Stop auto-arm, and turn-end guard fire inside each tree
+# under a chosen environment. Claude's live-session registry is a fixture
+# directory whose entries the test writes with the real pids.
+
+make_parked_session_home() {  # <dir>
+  local dir=$1
+  mkdir -p "$dir/state" "$dir/claude-config/sessions"
+  git init -q "$dir"
+  git -C "$dir" commit -q --allow-empty -m init
+  : > "$dir/AGENTS.md"
+  : > "$dir/state/task.meta"
+  cp -R "$ROOT/bin" "$dir/bin"
+  install_autoarm_scripts "$dir"
+  cat > "$dir/runner.sh" <<'SH'
+#!/usr/bin/env bash
+role=$1
+if [ "${FM_FIXTURE_ORPHAN_HERE:-0}" = 1 ]; then
+  i=0
+  while [ "$i" -lt 200 ] && [ "$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')" != 1 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+fi
+printf '%s\n' "$$" > "$FM_HOME/state/$role-pid"
+n=1
+while [ ! -e "$FM_HOME/state/stop-$role" ]; do
+  req="$FM_HOME/state/$role-fire-$n"
+  if [ -f "$req" ]; then
+    out="$FM_HOME/state/$role-phase-$n"
+    mkdir -p "$out"
+    unset CLAUDE_CODE_SESSION_ID CLAUDE_PID FM_PHASE_STEPS
+    # shellcheck disable=SC1090
+    . "$req"
+    for step in ${FM_PHASE_STEPS:-autoarm guard lock}; do
+      case "$step" in
+        autoarm)
+          printf '%s\n' '{"session_id":"fixture","stop_hook_active":true}' \
+            | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" > "$out/hook.out" 2>&1
+          printf '%s\n' "$?" > "$out/hook.rc"
+          ;;
+        guard)
+          printf '%s\n' '{"session_id":"fixture","stop_hook_active":true}' \
+            | "$FM_HOME/bin/fm-turnend-guard.sh" --claude > "$out/guard.out" 2>&1
+          printf '%s\n' "$?" > "$out/guard.rc"
+          ;;
+        lock)
+          "$FM_HOME/bin/fm-lock.sh" > "$out/lock.out" 2>&1
+          printf '%s\n' "$?" > "$out/lock.rc"
+          ;;
+      esac
+    done
+    cp "$FM_HOME/state/.lock" "$out/lock-after"
+    [ ! -e "$FM_HOME/state/.lock-session" ] || cp "$FM_HOME/state/.lock-session" "$out/session-after"
+    : > "$out/done"
+    n=$((n + 1))
+  fi
+  sleep 0.05
+done
+exit 0
+SH
+  cat > "$dir/ptyhost.sh" <<'SH'
+#!/usr/bin/env bash
+i=0
+while [ "$i" -lt 200 ] && [ "$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')" != 1 ]; do
+  sleep 0.05
+  i=$((i + 1))
+done
+printf '%s\n' "$$" > "$FM_HOME/state/ptyhost-pid"
+"$FM_FIXTURE_ENGINE" "$FM_HOME/runner.sh" engine &
+while [ ! -e "$FM_HOME/state/stop-engine" ]; do sleep 0.1; done
+exit 0
+SH
+  chmod +x "$dir/runner.sh" "$dir/ptyhost.sh"
+}
+
+fire_role_phase() {  # <dir> <role> <n> <hook-environment-script>
+  local dir=$1 role=$2 n=$3 i=0
+  printf '%s\n' "$4" > "$dir/state/$role-fire-$n.tmp"
+  mv "$dir/state/$role-fire-$n.tmp" "$dir/state/$role-fire-$n"
+  while [ "$i" -lt 600 ] && [ ! -e "$dir/state/$role-phase-$n/done" ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -e "$dir/state/$role-phase-$n/done" ] || fail "parked-session fixture never finished $role phase $n"
+}
+
+role_value() {  # <dir> <role> <n> <file>
+  tr -d '[:space:]' < "$1/state/$2-phase-$3/$4"
+}
+
+role_text() {  # <dir> <role> <n> <file>
+  cat "$1/state/$2-phase-$3/$4" 2>/dev/null
+}
+
+test_e2e_parked_conversation_takes_over_its_clients_lock() {
+  local dir config client engine ptyhost epoch_before
+  dir="$TMP_ROOT/e2e-parked-session"
+  config="$dir/claude-config"
+  make_parked_session_home "$dir"
+  env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID \
+    FM_HOME="$dir" CLAUDE_CONFIG_DIR="$config" FM_FIXTURE_ORPHAN_HERE=1 \
+    FM_POLL=1 FM_HEARTBEAT=999999 FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=0 \
+    bash -c '"$0" "$1" client &' "$NAMED_CLAUDE" "$dir/runner.sh"
+  wait_for_file "$dir/state/client-pid" "the terminal client"
+  client=$(tr -d '[:space:]' < "$dir/state/client-pid")
+  BG_FIXTURE_PIDS+=("$client")
+  # The client takes the lock for its conversation C0, then re-keys to a fresh
+  # id C1 when the conversation leaves - the sidecar the engine then finds.
+  fire_role_phase "$dir" client 1 'export FM_PHASE_STEPS=lock CLAUDE_CODE_SESSION_ID=C0 CLAUDE_PID=$$'
+  expect_code 0 "$(role_value "$dir" client 1 lock.rc)" "the client could not take the lock: $(role_text "$dir" client 1 lock.out)"
+  fire_role_phase "$dir" client 2 'export FM_PHASE_STEPS=lock CLAUDE_CODE_SESSION_ID=C1 CLAUDE_PID=$$'
+  [ "$(tr -d '[:space:]' < "$dir/state/.lock")" = "$client" ] || fail "the client's lock does not name the client $client"
+  [ "$(tr -d '[:space:]' < "$dir/state/.lock-session")" = C1 ] || fail "the client did not re-key the sidecar to C1"
+
+  env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID \
+    FM_HOME="$dir" CLAUDE_CONFIG_DIR="$config" FM_FIXTURE_ENGINE="$VERSIONED_CLAUDE" \
+    FM_POLL=1 FM_HEARTBEAT=999999 FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=0 \
+    bash -c '"$0" "$1" &' "$NAMED_CLAUDE" "$dir/ptyhost.sh"
+  wait_for_file "$dir/state/engine-pid" "the background engine"
+  engine=$(tr -d '[:space:]' < "$dir/state/engine-pid")
+  ptyhost=$(tr -d '[:space:]' < "$dir/state/ptyhost-pid")
+  BG_FIXTURE_PIDS+=("$engine" "$ptyhost")
+  write_claude_session_entry "$config" "$client" \
+    "{\"pid\":$client,\"sessionId\":\"C0\",\"kind\":\"interactive\",\"parkedJobId\":\"f44b1372\"}"
+  write_claude_session_entry "$config" "$engine" \
+    "{\"pid\":$engine,\"sessionId\":\"E1\",\"kind\":\"bg\",\"jobId\":\"f44b1372\"}"
+
+  # Phase 1 - the reported incident: a Stop in the background conversation
+  # while the idle client still holds the lock under its own fresh id.
+  fire_role_phase "$dir" engine 1 'export CLAUDE_CODE_SESSION_ID=E1 CLAUDE_PID=$$'
+  expect_code 2 "$(role_value "$dir" engine 1 hook.rc)" \
+    "the Stop auto-arm did not claim the home for the background conversation: $(role_text "$dir" engine 1 hook.out)"
+  [ "$(arm_count "$dir")" = 2 ] || fail "the background conversation armed $(arm_count "$dir") time(s), expected 2"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "no rewake claim was recorded, got: $(epoch_outcome "$dir")"
+  [ "$(role_value "$dir" engine 1 lock-after)" = "$engine" ] \
+    || fail "lock line 1 is $(role_value "$dir" engine 1 lock-after), expected the engine $engine"
+  [ "$(role_value "$dir" engine 1 session-after)" = E1 ] \
+    || fail "the sidecar names $(role_value "$dir" engine 1 session-after), expected the conversation's id E1"
+  expect_code 0 "$(role_value "$dir" engine 1 guard.rc)" "the turn-end guard blocked the owning conversation: $(role_text "$dir" engine 1 guard.out)"
+  if grep -q 'OWNED BY ANOTHER LIVE SESSION' "$dir/state/engine-phase-1/guard.out"; then
+    fail "the guard reported the conversation's own client as a foreign owner"
+  fi
+  expect_code 0 "$(role_value "$dir" engine 1 lock.rc)" "fm-lock.sh refused the conversation's lock: $(role_text "$dir" engine 1 lock.out)"
+
+  # Phase 2 - the idle client is now the other session: read-only, visibly.
+  fire_role_phase "$dir" client 3 'export FM_PHASE_STEPS="lock autoarm guard" CLAUDE_CODE_SESSION_ID=C1 CLAUDE_PID=$$'
+  expect_code 1 "$(role_value "$dir" client 3 lock.rc)" "the client took the lock back from its live background conversation"
+  grep -q "another live firstmate session holds the lock (pid $engine, session E1)" "$dir/state/client-phase-3/lock.out" \
+    || fail "the client's refusal did not name the conversation: $(role_text "$dir" client 3 lock.out)"
+  expect_code 2 "$(role_value "$dir" client 3 hook.rc)" "the client's auto-arm stood down silently"
+  grep -q "STOOD DOWN.*pid $engine, session E1" "$dir/state/client-phase-3/hook.out" \
+    || fail "the client's stand-down notice did not name the owner: $(role_text "$dir" client 3 hook.out)"
+  grep -q "OWNED BY ANOTHER LIVE SESSION.*lock owner pid $engine" "$dir/state/client-phase-3/guard.out" \
+    || fail "the client's guard did not report the owner: $(role_text "$dir" client 3 guard.out)"
+  [ "$(arm_count "$dir")" = 2 ] || fail "the read-only client armed supervision"
+  [ "$(role_value "$dir" client 3 lock-after)" = "$engine" ] || fail "the client rewrote the conversation's lock"
+
+  # Phases 3-4 - without Claude's link the same live client keeps its lock: the
+  # engine stands down with one visible notice, then stays silent.
+  printf '%s\n' "$client" > "$dir/state/.lock"
+  printf 'C1\n' > "$dir/state/.lock-session"
+  write_claude_session_entry "$config" "$client" \
+    "{\"pid\":$client,\"sessionId\":\"C0\",\"kind\":\"interactive\",\"parkedJobId\":\"0ther000\"}"
+  epoch_before=$(cat "$dir/state/.claude-autoarm-epoch")
+  fire_role_phase "$dir" engine 2 'export CLAUDE_CODE_SESSION_ID=E1 CLAUDE_PID=$$'
+  expect_code 2 "$(role_value "$dir" engine 2 hook.rc)" "an unlinked background session stood down silently"
+  grep -q "STOOD DOWN.*pid $client, session C1" "$dir/state/engine-phase-2/hook.out" \
+    || fail "the stand-down notice did not name the live owner and its id: $(role_text "$dir" engine 2 hook.out)"
+  grep -q "OWNED BY ANOTHER LIVE SESSION.*lock owner pid $client" "$dir/state/engine-phase-2/guard.out" \
+    || fail "the guard did not report the unlinked owner: $(role_text "$dir" engine 2 guard.out)"
+  expect_code 1 "$(role_value "$dir" engine 2 lock.rc)" "fm-lock.sh handed over a lock without Claude's link"
+  [ "$(role_value "$dir" engine 2 lock-after)" = "$client" ] || fail "an unlinked session rewrote the client's lock"
+  fire_role_phase "$dir" engine 3 'export CLAUDE_CODE_SESSION_ID=E1 CLAUDE_PID=$$'
+  expect_code 0 "$(role_value "$dir" engine 3 hook.rc)" "the stand-down notice repeated within one episode"
+  [ ! -s "$dir/state/engine-phase-3/hook.out" ] || fail "a repeated stand-down printed: $(role_text "$dir" engine 3 hook.out)"
+  [ "$(arm_count "$dir")" = 2 ] || fail "a standing-down session armed supervision"
+  [ "$(cat "$dir/state/.claude-autoarm-epoch")" = "$epoch_before" ] || fail "a standing-down session wrote the auto-arm ledger"
+
+  # Phase 5 - session start's own acquisition performs the same handoff and
+  # says so once the link is back.
+  write_claude_session_entry "$config" "$client" \
+    "{\"pid\":$client,\"sessionId\":\"C0\",\"kind\":\"interactive\",\"parkedJobId\":\"f44b1372\"}"
+  fire_role_phase "$dir" engine 4 'export FM_PHASE_STEPS=lock CLAUDE_CODE_SESSION_ID=E1 CLAUDE_PID=$$'
+  expect_code 0 "$(role_value "$dir" engine 4 lock.rc)" "session start refused the parked conversation's lock: $(role_text "$dir" engine 4 lock.out)"
+  grep -qx "lock acquired: harness pid $engine" "$dir/state/engine-phase-4/lock.out" \
+    || fail "the handoff did not report the acquisition: $(role_text "$dir" engine 4 lock.out)"
+  grep -q "handed over from pid $client" "$dir/state/engine-phase-4/lock.out" \
+    || fail "the handoff did not say whose lock it took: $(role_text "$dir" engine 4 lock.out)"
+  [ "$(role_value "$dir" engine 4 lock-after)" = "$engine" ] || fail "session start did not re-point the lock at the engine"
+  [ "$(role_value "$dir" engine 4 session-after)" = E1 ] || fail "session start did not record the conversation's id"
+
+  : > "$dir/state/stop-client"
+  : > "$dir/state/stop-engine"
+  pass "session-lock e2e: a conversation moved to the background takes over its idle client's lock, and nothing weaker does"
 }
 
 # A same-session confirmation must refresh a /clear re-key even while another
@@ -1106,10 +1481,12 @@ test_harness_beyond_a_gap_never_owns_the_lock
 test_competing_version_named_session_is_seen_as_live
 test_same_session_id_owns_a_recycled_background_chain
 test_anchor_pid_is_the_model_loop_process_only_for_a_trusted_id
+test_parked_client_lock_is_handed_to_its_background_session
 test_e2e_version_named_session_claims_the_home
 test_e2e_daemon_parented_session_claims_the_home
 test_e2e_daemon_parented_version_named_session_keeps_its_lock
 test_e2e_background_session_keeps_its_lock_across_a_recycled_chain
+test_e2e_parked_conversation_takes_over_its_clients_lock
 test_same_session_confirmation_refreshes_rekeyed_id_under_claim_lock
 test_same_session_confirmation_does_not_steal_after_wait
 test_failed_lock_write_restores_previous_sidecar

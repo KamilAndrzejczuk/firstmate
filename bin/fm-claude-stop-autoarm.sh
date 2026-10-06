@@ -16,9 +16,14 @@
 #     session id (which is what keeps a background session arming after its
 #     transient helper chain is recycled).
 #     When an existing numeric owner fails the shared harness-liveness predicate,
-#     the hook delegates guarded recovery to bin/fm-lock.sh and then re-verifies
-#     ownership. A live owner, missing lock, malformed lock, or unresolved
-#     ancestry remains inert, so a competing session never arms or rewakes.
+#     or is the Claude terminal client whose conversation Claude Code moved into
+#     this background session (fm_session_lock_parked_by_self), the hook
+#     delegates guarded recovery to bin/fm-lock.sh and then re-verifies
+#     ownership. A missing or malformed lock remains inert. Any other live owner
+#     never lets this session arm or rewake for supervision; once supervision is
+#     needed and away mode is off, the first such Stop of each stand-down
+#     episode exits 2 with a read-only notice naming the owner, and later Stops
+#     of that episode stay silent (state/.claude-autoarm-standdown-notified).
 #   - AFK: while state/.afk exists the away daemon owns the watcher and triage;
 #     this hook exits 0 and NEVER rewakes the primary (checked again at
 #     translation time so a mid-cycle AFK transition is honored).
@@ -105,9 +110,9 @@
 #
 # In hook mode it never blocks the Stop decision itself or prints to stdout:
 # exit 0 is silent, and exit 2 carries the rewake banner on stderr.
-# On any uncertainty such as unresolvable ancestry, malformed lock state, or
-# lock contention, it exits 0 and leaves continuity to the synchronous guard and
-# the model.
+# On any uncertainty such as malformed lock state or lock contention, it exits 0
+# and leaves continuity to the synchronous guard and the model. An ancestry that
+# cannot prove ownership of a live lock is the visible stand-down above.
 #
 # The Stop hook passes no arguments, so any argument means a manual run: -h or
 # --help prints usage and an unknown argument is refused, both before anything
@@ -198,19 +203,25 @@ fi
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 
 # --- identity: only the lock-owning session's hooks may arm ------------------
-# A prior session may have died after leaving its numeric harness pid in .lock.
-# Use the shared liveness predicate to recognize only that stale-owner case.
-# Defer the mutating claim until after the unchanged AFK and need gates, so an
-# idle or away home remains byte-for-byte inert. Missing or malformed locks are
-# uncertainty rather than stale-owner evidence and remain inert.
+# A prior session may have died after leaving its numeric harness pid in .lock,
+# or Claude Code may have moved this conversation into a background session
+# while the terminal client that recorded the lock stays alive. The shared
+# liveness and parked-handoff predicates recognize only those two takeover
+# cases. Defer the mutating claim until after the unchanged AFK and need gates,
+# so an idle or away home remains byte-for-byte inert. Missing or malformed
+# locks are uncertainty rather than stale-owner evidence and remain inert.
 RECOVER_SESSION_LOCK=0
+FOREIGN_LOCK_PID=
 if ! fm_session_lock_owned_by_self "$STATE"; then
   LOCK_PID=$(cat "$STATE/.lock" 2>/dev/null || true)
   case "$LOCK_PID" in
     ''|*[!0-9]*) exit 0 ;;
   esac
-  fm_harness_pid_alive "$LOCK_PID" && exit 0
-  RECOVER_SESSION_LOCK=1
+  if ! fm_harness_pid_alive "$LOCK_PID" || fm_session_lock_parked_by_self "$STATE"; then
+    RECOVER_SESSION_LOCK=1
+  else
+    FOREIGN_LOCK_PID=$LOCK_PID
+  fi
 fi
 
 # --- AFK: the away daemon owns the watcher and triage; never rewake ----------
@@ -222,10 +233,50 @@ need_supervision() {
 }
 need_supervision || exit 0
 
-# --- stale session-lock recovery ---------------------------------------------
-# Delegate the claim to fm-lock.sh so its live-owner refusal and write semantics
-# remain the single acquisition owner, then re-verify current-session identity
-# before touching any auto-arm state.
+# --- visible stand-down --------------------------------------------------------
+# Another live session holds the lock and this session cannot prove it is that
+# session, so it must never arm or rewake for supervision. Standing down in
+# silence let a session whose supervision had quietly stopped run blind for
+# hours, so the first Stop of each stand-down episode exits 2 once with a
+# read-only notice instead. The episode is this session's lock anchor against
+# the owner's pid and recorded id; later Stops of the same episode exit 0, so the
+# notice can never become a rewake loop, and a marker that cannot be written
+# suppresses the notice rather than repeating it. The marker keeps one bounded
+# line per standing-down session and touches no lock, ledger, or watcher state.
+STANDDOWN_NOTICE="$STATE/.claude-autoarm-standdown-notified"
+announce_stand_down() {  # <owner-pid>
+  local owner=$1 self owner_session line tmp
+  self=$(fm_session_lock_anchor_pid 2>/dev/null) || self=unresolved
+  owner_session=$(fm_session_lock_recorded_session_id "$STATE" 2>/dev/null) || owner_session=
+  line="self=$self owner=$owner session=${owner_session:-none}"
+  if [ -f "$STANDDOWN_NOTICE" ] && [ ! -L "$STANDDOWN_NOTICE" ] \
+    && grep -qxF -- "$line" "$STANDDOWN_NOTICE" 2>/dev/null; then
+    exit 0
+  fi
+  [ ! -L "$STANDDOWN_NOTICE" ] || exit 0
+  tmp=$(mktemp "$STANDDOWN_NOTICE.XXXXXX" 2>/dev/null) || exit 0
+  if ! {
+    { grep -v -- "^self=$self " "$STANDDOWN_NOTICE" 2>/dev/null | tail -n 15
+      printf '%s\n' "$line"; } > "$tmp" && mv -f "$tmp" "$STANDDOWN_NOTICE"
+  } 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    exit 0
+  fi
+  if [ -n "$owner_session" ]; then
+    owner="$owner, session $owner_session"
+  fi
+  printf 'firstmate watcher auto-arm STOOD DOWN: another live session holds this home'"'"'s session lock (pid %s), and this session could not prove it is that session.\n' "$owner" >&2
+  printf 'This session is read-only for the fleet: it will not arm the watcher, and no wake will reach it. Report that supervision is not running from this session; the session holding the lock must restore it, or must exit so this one can take over.\n' >&2
+  printf 'This notice is shown once while that session holds the lock.\n' >&2
+  exit 2
+}
+[ -z "$FOREIGN_LOCK_PID" ] || announce_stand_down "$FOREIGN_LOCK_PID"
+
+# --- stale or parked session-lock recovery -------------------------------------
+# Delegate the claim (a dead owner's reclaim or a parked client's handoff) to
+# fm-lock.sh so its live-owner refusal and write semantics remain the single
+# acquisition owner, then re-verify current-session identity before touching
+# any auto-arm state.
 if [ "$RECOVER_SESSION_LOCK" -eq 1 ]; then
   "$SCRIPT_DIR/fm-lock.sh" >/dev/null 2>&1 || exit 0
   fm_session_lock_owned_by_self "$STATE" || exit 0

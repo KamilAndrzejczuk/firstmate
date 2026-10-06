@@ -18,7 +18,12 @@
 # and left byte-identical when it already names that id. A same-session
 # confirmation never rewrites line 1 while the recorded pid is alive, because
 # bin/fm-startup-network.sh compares that pid across its deferred sweeps; a dead
-# recorded pid is reclaimed and rewritten to this session's anchor.
+# recorded pid is reclaimed and rewritten to this session's anchor. So is one
+# live recorded pid: the Claude terminal client whose conversation Claude Code
+# moved into this background session (fm_session_lock_parked_by_self owns that
+# proof). That handoff re-points line 1 and the sidecar at the conversation, so
+# the idle client becomes the read-only session and its deferred sweeps stand
+# down; the extra "handed over" line names the client it replaced.
 #
 # Usage: fm-lock.sh           acquire; exit 1 unless ownership is verified
 #        fm-lock.sh status    print holder and liveness; always exits 0.
@@ -189,13 +194,14 @@ refuse_live_owner() {  # <recorded-pid>
   exit 1
 }
 
+HANDED_OVER_FROM=
 if [ -f "$LOCK" ] && [ ! -L "$LOCK" ]; then
   old=$(cat "$LOCK" 2>/dev/null || true)
   if [ "$old" = "$me" ] || fm_session_lock_owned_by_self "$STATE"; then
     confirm_own_lock "$old"
     old=$(cat "$LOCK" 2>/dev/null || true)
   fi
-  if fm_harness_pid_alive "$old"; then
+  if fm_harness_pid_alive "$old" && ! fm_session_lock_parked_by_self "$STATE"; then
     refuse_live_owner "$old"
   fi
 fi
@@ -223,7 +229,9 @@ if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
     fm_session_lock_owned_by_self "$STATE" && confirm_own_lock "$old"
     old=$(cat "$LOCK" 2>/dev/null || true)
     if [ "$old" != "$me" ] && fm_harness_pid_alive "$old"; then
-      refuse_live_owner "$old"
+      # Re-proved under the claim lock, against the line this write replaces.
+      fm_session_lock_parked_by_self "$STATE" || refuse_live_owner "$old"
+      HANDED_OVER_FROM=$old
     fi
   fi
 fi
@@ -273,3 +281,6 @@ fi
 commit_lock_session
 release_claim_lock
 echo "lock acquired: harness pid $me"
+if [ -n "$HANDED_OVER_FROM" ]; then
+  echo "lock handed over from pid $HANDED_OVER_FROM: that Claude terminal moved its conversation into this background session"
+fi

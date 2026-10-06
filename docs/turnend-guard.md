@@ -115,6 +115,7 @@ The exception has these limits:
 
 - Malformed, absent, dead, or ancestry-uncertain lock records do not satisfy this Claude-specific exception and retain the ordinary guard behavior.
 - A missing or mismatched sidecar or an untrusted id adds nothing to the verdict, so a live owner outside the ancestry still takes this exit exactly as before.
+- A live owner that is the terminal client whose conversation Claude Code moved into this background session is not a foreign owner; that session takes the lock over through `bin/fm-lock.sh` (`fm_session_lock_parked_by_self` owns the proof), so its guard keeps the ordinary cooperative path.
 
 ### Pull-warning verdict by supervision model
 
