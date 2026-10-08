@@ -1184,6 +1184,97 @@ test_e2e_parked_conversation_takes_over_its_clients_lock() {
   pass "session-lock e2e: a conversation moved to the background takes over its idle client's lock, and nothing weaker does"
 }
 
+# The client's own Stop hook may still be parked in its arm when its
+# conversation leaves. Its open claim was armed for the client's lock, so once
+# the background conversation takes the lock that claim can never commit a
+# rewake and must not make the new owner defer: the new owner arms its own
+# cycle and the next watcher event wakes it, while the old hook goes silent.
+test_e2e_parked_conversation_is_woken_past_its_clients_open_claim() {
+  local dir config client engine ptyhost i
+  dir="$TMP_ROOT/e2e-parked-open-claim"
+  config="$dir/claude-config"
+  make_parked_session_home "$dir"
+  # Every arm attaches to one shared cycle that closes on the next watcher event.
+  cat > "$dir/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+echo "$$" >> "$FM_HOME/state/arm-ran"
+printf 'pending:downtime:fixture-generation\n' > "$FM_HOME/state/.watcher-down"
+touch "$FM_HOME/state/.last-watcher-beat"
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+i=0
+while [ "$i" -lt 600 ] && [ ! -e "$FM_HOME/state/watcher-event" ]; do
+  sleep 0.05
+  i=$((i + 1))
+done
+[ -e "$FM_HOME/state/watcher-event" ] && printf 'stale: fixture-event actionable\n'
+exit 0
+SH
+  chmod +x "$dir/bin/fm-watch-arm.sh"
+  env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID \
+    FM_HOME="$dir" CLAUDE_CONFIG_DIR="$config" FM_FIXTURE_ORPHAN_HERE=1 \
+    FM_POLL=1 FM_HEARTBEAT=999999 FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=0 \
+    bash -c '"$0" "$1" client &' "$NAMED_CLAUDE" "$dir/runner.sh"
+  wait_for_file "$dir/state/client-pid" "the terminal client"
+  client=$(tr -d '[:space:]' < "$dir/state/client-pid")
+  BG_FIXTURE_PIDS+=("$client")
+  fire_role_phase "$dir" client 1 'export FM_PHASE_STEPS=lock CLAUDE_CODE_SESSION_ID=C0 CLAUDE_PID=$$'
+  expect_code 0 "$(role_value "$dir" client 1 lock.rc)" "the client could not take the lock: $(role_text "$dir" client 1 lock.out)"
+
+  # The client's Stop hook claims and parks in its arm, holding a live claim.
+  printf '%s\n' 'export FM_PHASE_STEPS=autoarm CLAUDE_CODE_SESSION_ID=C0 CLAUDE_PID=$$' > "$dir/state/client-fire-2"
+  i=0
+  while [ "$i" -lt 400 ] && { [ "$(arm_count "$dir")" != 1 ] || [ "$(epoch_outcome "$dir")" != arming ]; }; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ "$(epoch_outcome "$dir")" = arming ] || fail "the client's hook never held an open claim"
+
+  env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID \
+    FM_HOME="$dir" CLAUDE_CONFIG_DIR="$config" FM_FIXTURE_ENGINE="$VERSIONED_CLAUDE" \
+    FM_POLL=1 FM_HEARTBEAT=999999 FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=0 \
+    bash -c '"$0" "$1" &' "$NAMED_CLAUDE" "$dir/ptyhost.sh"
+  wait_for_file "$dir/state/engine-pid" "the background engine"
+  engine=$(tr -d '[:space:]' < "$dir/state/engine-pid")
+  ptyhost=$(tr -d '[:space:]' < "$dir/state/ptyhost-pid")
+  BG_FIXTURE_PIDS+=("$engine" "$ptyhost")
+  write_claude_session_entry "$config" "$client" \
+    "{\"pid\":$client,\"sessionId\":\"C0\",\"kind\":\"interactive\",\"parkedJobId\":\"f44b1372\"}"
+  write_claude_session_entry "$config" "$engine" \
+    "{\"pid\":$engine,\"sessionId\":\"E1\",\"kind\":\"bg\",\"jobId\":\"f44b1372\"}"
+
+  # The background conversation's Stop takes the lock; then the event arrives.
+  printf '%s\n' 'export FM_PHASE_STEPS=autoarm CLAUDE_CODE_SESSION_ID=E1 CLAUDE_PID=$$' > "$dir/state/engine-fire-1"
+  i=0
+  while [ "$i" -lt 400 ] && [ "$(arm_count "$dir")" -lt 2 ] && [ ! -e "$dir/state/engine-phase-1/done" ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  : > "$dir/state/watcher-event"
+  i=0
+  while [ "$i" -lt 600 ] && { [ ! -e "$dir/state/engine-phase-1/done" ] || [ ! -e "$dir/state/client-phase-2/done" ]; }; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -e "$dir/state/engine-phase-1/done" ] && [ -e "$dir/state/client-phase-2/done" ] \
+    || fail "the client and engine hooks did not both finish after the watcher event"
+
+  [ "$(role_value "$dir" engine 1 lock-after)" = "$engine" ] \
+    || fail "lock line 1 is $(role_value "$dir" engine 1 lock-after), expected the engine $engine"
+  expect_code 2 "$(role_value "$dir" engine 1 hook.rc)" \
+    "the background conversation was not woken by the watcher event: $(role_text "$dir" engine 1 hook.out)"
+  grep -q '^stale: fixture-event actionable' "$dir/state/engine-phase-1/hook.out" \
+    || fail "the new owner's wake did not carry the event: $(role_text "$dir" engine 1 hook.out)"
+  expect_code 0 "$(role_value "$dir" client 2 hook.rc)" "the superseded client hook delivered a wake"
+  [ ! -s "$dir/state/client-phase-2/hook.out" ] || fail "the superseded client hook printed: $(role_text "$dir" client 2 hook.out)"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "no rewake was recorded, got: $(epoch_outcome "$dir")"
+  grep -q " session_pid=$engine " "$dir/state/.claude-autoarm-epoch" \
+    || fail "the rewake is not bound to the engine: $(cat "$dir/state/.claude-autoarm-epoch")"
+
+  : > "$dir/state/stop-client"
+  : > "$dir/state/stop-engine"
+  pass "session-lock e2e: a conversation that takes its parked client's lock is woken past the client's open claim"
+}
+
 # A same-session confirmation must refresh a /clear re-key even while another
 # process holds .lock.acquire. The prior-session-sweep-is-finishing refusal is
 # a takeover rule and does not apply here; the confirmation waits, then writes
@@ -1486,6 +1577,7 @@ test_e2e_daemon_parented_session_claims_the_home
 test_e2e_daemon_parented_version_named_session_keeps_its_lock
 test_e2e_background_session_keeps_its_lock_across_a_recycled_chain
 test_e2e_parked_conversation_takes_over_its_clients_lock
+test_e2e_parked_conversation_is_woken_past_its_clients_open_claim
 test_same_session_confirmation_refreshes_rekeyed_id_under_claim_lock
 test_same_session_confirmation_does_not_steal_after_wait
 test_failed_lock_write_restores_previous_sidecar

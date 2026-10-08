@@ -336,13 +336,15 @@ A claim is open while all of these hold:
 - Its outcome is `arming`.
 - Its owner pid is alive.
 - Its recorded identity successfully recomputes and matches that pid.
+- The session-lock pid it recorded when it claimed is still lock line 1.
 - It is not stuck.
 
 Stuck means the entry and the watcher beacon are both older than the guard grace, which proves the owner hung mid-arm.
 A healthy hours-long foregrounded cycle keeps the beacon beating, and every arming phase with no watcher is bounded in seconds.
 
 Anything else lets the next Stop-owned firing take the next generation and arm.
-That covers a finished outcome, a dead or identity-mismatched owner, a stuck owner, an identityless entry, or no entry.
+That covers a finished outcome, a dead or identity-mismatched owner, a claim armed for a previous session-lock owner, a stuck owner, an identityless entry, or no entry.
+A claim armed for a previous owner can never commit a rewake, so it must not shut out the session that took the lock, such as a conversation Claude Code moved into a background session while its terminal client's hook was still parked.
 Taking a newer generation is the reclaim, and a steady-state predecessor is never signalled or revoked.
 
 No mutex is held across arming or output.

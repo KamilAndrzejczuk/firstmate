@@ -1339,7 +1339,13 @@ test_superseded_owner_goes_silent_and_never_double_translates() {
     sleep 0.1
     i=$((i + 1))
   done
-  b_out=$(run_autoarm "$dir" 2>/dev/null); b_status=$?
+  # B is another firing of A's session: it keeps A's lock and owns it through
+  # the session id recorded beside it, so A's claim is still that owner's.
+  printf 'sess-autoarm\n' > "$dir/state/.lock-session"
+  b_out=$(printf '%s\n' '{"session_id":"sess-autoarm","stop_hook_active":false}' \
+    | FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+        CLAUDE_CODE_SESSION_ID=sess-autoarm CLAUDE_PID=$$ "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
+      ' 2>/dev/null); b_status=$?
   expect_code 0 "$b_status" "a firing during a live open claim must defer promptly (no mutex is held across arming)"
   [ -z "$b_out" ] || fail "deferring firing produced output: $b_out"
   count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')

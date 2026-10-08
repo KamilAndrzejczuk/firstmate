@@ -393,6 +393,15 @@ ok - session-lock e2e: a conversation moved to the background takes over its idl
 ok - auto-arm: a live foreign owner gets one visible stand-down notice and no arm, epoch, or lock replacement
 ok - Claude Code 2.1.289: live client 6372 hands its lock only to its background session 53013 (job f44b1372)
 ```
+
+Added 2026-10-08: the client's own Stop hook can still be parked in its arm when the conversation leaves, holding an open auto-arm claim recorded against the client's lock.
+Such a claim can never commit a rewake once the lock moves, so `fm_autoarm_claim_open` no longer treats a claim whose recorded `session_pid` is not lock line 1 as open, and the new owner arms its own cycle while the client's hook goes silent.
+`tests/fm-session-lock-ancestry.test.sh` covers it in the real orphaned client and engine tree with `config/supervision-host-off`: the client holds a live claim, the engine takes the lock, a watcher event arrives, and only the engine is woken.
+It ran on 2026-10-08 on macOS and failed with exit 0 for the engine before the fix:
+
+```text
+ok - session-lock e2e: a conversation that takes its parked client's lock is woken past the client's open claim
+```
 [`sessionstart-nudge.md`](../sessionstart-nudge.md#shared-wrapper-and-safety) owns the nudge wrapper's separate ancestry check and its redundant-nudge behavior after helper-chain recycling.
 `tests/fm-watch-arm.test.sh` runs real watcher and arm cycles against durable on-disk state to verify that a delivered reason survives until post-handling acknowledgement and stops replaying after acknowledgement, while an unrelated queue append cannot make a watcher cycle that delivered nothing look successful.
 The same suite ingests a keyed remote-secondmate parent reply through the real adapter, establishes the incremental OPEN DECISIONS cursor, interrupts supervision, and proves re-arm replays every unacknowledged queue row plus the still-open decision through the ordinary drain path.
