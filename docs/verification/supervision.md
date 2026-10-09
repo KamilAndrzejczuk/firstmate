@@ -397,7 +397,7 @@ ok - Claude Code 2.1.289: live client 6372 hands its lock only to its background
 Added 2026-10-08: the client's own Stop hook can still be parked in its arm when the conversation leaves, holding an open auto-arm claim recorded against the client's lock.
 Such a claim can never commit a rewake once the lock moves, so `fm_autoarm_claim_open` no longer treats a claim whose recorded `session_pid` is not lock line 1 as open, and the new owner arms its own cycle while the client's hook goes silent.
 `tests/fm-session-lock-ancestry.test.sh` covers it in the real orphaned client and engine tree with `config/supervision-host-off`: the client holds a live claim, the engine takes the lock, a watcher event arrives, and only the engine is woken.
-It ran on 2026-10-08 on macOS and failed with exit 0 for the engine before the fix:
+Before the fix it failed with exit 0 for the engine; after it, it passed on 2026-10-08 on macOS:
 
 ```text
 ok - session-lock e2e: a conversation that takes its parked client's lock is woken past the client's open claim
