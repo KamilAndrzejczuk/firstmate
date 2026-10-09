@@ -1,0 +1,5 @@
+Test phase summary (2026-10-09, Claude Code 2.1.295, macOS)
+- tests/fm-session-lock-ancestry.test.sh: exit 0, 19 ok (includes parked handoff + engine-woken-past-client-claim e2e)
+- tests/fm-claude-stop-autoarm.test.sh: exit 0, 59 ok (includes one-time stand-down notice)
+- tests/fm-claude-parked-session-live-e2e.test.sh: SKIP - no parked Claude conversation in ~/.claude/sessions (all entries kind=interactive, parkedJobId=null)
+- tmux not on PATH: runbook lab-primary (tmux -L fm-lab) cannot be started
